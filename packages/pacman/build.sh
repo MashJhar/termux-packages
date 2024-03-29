@@ -10,6 +10,15 @@ TERMUX_PKG_BUILD_DEPENDS="doxygen, asciidoc, nettle"
 TERMUX_PKG_RECOMMENDS="termux-keyring"
 TERMUX_PKG_GROUPS="base-devel"
 TERMUX_PKG_CONFFILES="etc/pacman.conf, etc/pacman.d/serverlist, etc/makepkg.conf, var/log/pacman.log"
+TERMUX_PKG_EXTRA_CONFIGURE_ARGS="
+--prefix=${TERMUX_PREFIX}
+--sysconfdir=${TERMUX_PREFIX}/etc
+--localstatedir=${TERMUX_PREFIX}/var
+-Dpkg-ext=.pkg.tar.xz
+-Dscriptlet-shell=${TERMUX_PREFIX}/bin/bash
+-Dmakepkg-template-dir=${TERMUX_PREFIX}/share/makepkg-template
+-Di18n=false
+"
 
 termux_step_pre_configure() {
 	rm -f ./scripts/libmakepkg/executable/sudo.sh.in
