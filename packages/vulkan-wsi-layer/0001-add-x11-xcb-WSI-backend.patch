@@ -1,0 +1,1473 @@
+From ae5040ba8175fb03c02f68380af8a34ef88d91ee Mon Sep 17 00:00:00 2001
+From: xMeM <1244482642@qq.com>
+Date: Mon, 26 Jun 2023 23:24:52 +0800
+Subject: [PATCH] add x11/xcb WSI backend
+
+---
+ CMakeLists.txt                               |  23 +
+ layer/VkLayer_window_system_integration.json |   1 +
+ layer/private_data.hpp                       |  73 +--
+ wsi/wsi_factory.cpp                          |  12 +
+ wsi/x11/surface.cpp                          | 103 ++++
+ wsi/x11/surface.hpp                          |  66 +++
+ wsi/x11/surface_properties.cpp               | 264 +++++++++
+ wsi/x11/surface_properties.hpp               |  68 +++
+ wsi/x11/swapchain.cpp                        | 549 +++++++++++++++++++
+ wsi/x11/swapchain.hpp                        | 143 +++++
+ 10 files changed, 1268 insertions(+), 34 deletions(-)
+ create mode 100644 wsi/x11/surface.cpp
+ create mode 100644 wsi/x11/surface.hpp
+ create mode 100644 wsi/x11/surface_properties.cpp
+ create mode 100644 wsi/x11/surface_properties.hpp
+ create mode 100644 wsi/x11/swapchain.cpp
+ create mode 100644 wsi/x11/swapchain.hpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 62a9ccd..781e675 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -55,6 +55,7 @@ endif()
+ 
+ # Build Configuration options
+ option(BUILD_WSI_HEADLESS "Build with support for VK_EXT_headless_surface" ON)
++option(BUILD_WSI_X11 "Build with support for VK_KHR_xcb_surface" ON)
+ option(BUILD_WSI_WAYLAND "Build with support for VK_KHR_wayland_surface" OFF)
+ option(BUILD_WSI_IMAGE_COMPRESSION_CONTROL_SWAPCHAIN "Build with support for VK_EXT_image_compression_control_swapchain" OFF)
+ set(SELECT_EXTERNAL_ALLOCATOR "none" CACHE STRING "Select an external system allocator (none, ion)")
+@@ -183,6 +184,25 @@ else()
+    list(APPEND JSON_COMMANDS COMMAND sed -i '/VK_EXT_headless_surface/d' ${CMAKE_CURRENT_BINARY_DIR}/VkLayer_window_system_integration.json)
+ endif()
+ 
++# X11 WSI
++if(BUILD_WSI_X11)
++   add_library(wsi_x11 STATIC
++      wsi/x11/surface_properties.cpp
++      wsi/x11/surface.cpp
++      wsi/x11/swapchain.cpp)
++
++   target_include_directories(wsi_x11 PRIVATE
++      ${PROJECT_SOURCE_DIR}
++      ${VULKAN_CXX_INCLUDE}
++      ${CMAKE_CURRENT_BINARY_DIR})
++
++   target_compile_options(wsi_x11 INTERFACE "-DBUILD_WSI_X11=1")
++   target_compile_options(wsi_x11 PUBLIC "--target=linux-aarch64-android33")
++   list(APPEND LINK_WSI_LIBS wsi_x11 xcb xcb-present xcb-xfixes xcb-shm android)
++else()
++   list(APPEND JSON_COMMANDS COMMAND sed -i '/VK_KHR_xcb_surface/d' ${CMAKE_CURRENT_BINARY_DIR}/VkLayer_window_system_integration.json)
++endif()
++
+ # Layer
+ add_library(${PROJECT_NAME} SHARED
+    layer/layer.cpp
+@@ -216,3 +236,6 @@ target_link_libraries(${PROJECT_NAME} ${LINK_WSI_LIBS})
+ add_custom_target(manifest_json ALL COMMAND
+    cp ${PROJECT_SOURCE_DIR}/layer/VkLayer_window_system_integration.json ${CMAKE_CURRENT_BINARY_DIR}
+    ${JSON_COMMANDS})
++
++install(TARGETS ${PROJECT_NAME} DESTINATION share/vulkan/implicit_layer.d/)
++install(FILES ${CMAKE_CURRENT_BINARY_DIR}/VkLayer_window_system_integration.json DESTINATION share/vulkan/implicit_layer.d/)
+diff --git a/layer/VkLayer_window_system_integration.json b/layer/VkLayer_window_system_integration.json
+index f5c922c..4946abe 100644
+--- a/layer/VkLayer_window_system_integration.json
++++ b/layer/VkLayer_window_system_integration.json
+@@ -13,6 +13,7 @@
+         "instance_extensions": [
+             {"name" : "VK_EXT_headless_surface", "spec_version" : "1"},
+             {"name" : "VK_KHR_wayland_surface", "spec_version" : "6"},
++            {"name" : "VK_KHR_xcb_surface", "spec_version" : "1"},
+             {"name" : "VK_KHR_surface", "spec_version" : "25"},
+             {"name" : "VK_KHR_get_surface_capabilities2", "spec_version" : "1"}
+         ],
+diff --git a/layer/private_data.hpp b/layer/private_data.hpp
+index 02e40a0..7e99cfa 100644
+--- a/layer/private_data.hpp
++++ b/layer/private_data.hpp
+@@ -34,6 +34,8 @@
+ #include <vulkan/vk_layer.h>
+ #include <vulkan/vk_icd.h>
+ #include <vulkan/vulkan_wayland.h>
++#include <xcb/xcb.h>
++#include <vulkan/vulkan_xcb.h>
+ 
+ #include <memory>
+ #include <unordered_set>
+@@ -56,36 +58,38 @@ namespace layer
+  * guarantee than we can safely call them. We still mark the entrypoints with REQUIRED() and OPTIONAL(). The layer
+  * fails if vkGetInstanceProcAddr returns null for entrypoints that are REQUIRED().
+  */
+-#define INSTANCE_ENTRYPOINTS_LIST(REQUIRED, OPTIONAL)    \
+-   /* Vulkan 1.0 */                                      \
+-   REQUIRED(GetInstanceProcAddr)                         \
+-   REQUIRED(DestroyInstance)                             \
+-   REQUIRED(GetPhysicalDeviceProperties)                 \
+-   REQUIRED(GetPhysicalDeviceImageFormatProperties)      \
+-   REQUIRED(EnumerateDeviceExtensionProperties)          \
+-   /* VK_KHR_surface */                                  \
+-   OPTIONAL(DestroySurfaceKHR)                           \
+-   OPTIONAL(GetPhysicalDeviceSurfaceCapabilitiesKHR)     \
+-   OPTIONAL(GetPhysicalDeviceSurfaceFormatsKHR)          \
+-   OPTIONAL(GetPhysicalDeviceSurfacePresentModesKHR)     \
+-   OPTIONAL(GetPhysicalDeviceSurfaceSupportKHR)          \
+-   /* VK_EXT_headless_surface */                         \
+-   OPTIONAL(CreateHeadlessSurfaceEXT)                    \
+-   /* VK_KHR_wayland_surface */                          \
+-   OPTIONAL(CreateWaylandSurfaceKHR)                     \
+-   /* VK_KHR_get_surface_capabilities2 */                \
+-   OPTIONAL(GetPhysicalDeviceSurfaceCapabilities2KHR)    \
+-   OPTIONAL(GetPhysicalDeviceSurfaceFormats2KHR)         \
+-   /* VK_KHR_get_physical_device_properties2 or */       \
+-   /* 1.1 (without KHR suffix) */                        \
+-   OPTIONAL(GetPhysicalDeviceImageFormatProperties2KHR)  \
+-   OPTIONAL(GetPhysicalDeviceFormatProperties2KHR)       \
+-   OPTIONAL(GetPhysicalDeviceFeatures2KHR)               \
+-   /* VK_KHR_device_group + VK_KHR_surface or */         \
+-   /* 1.1 with VK_KHR_swapchain */                       \
+-   OPTIONAL(GetPhysicalDevicePresentRectanglesKHR)       \
+-   /* VK_KHR_external_fence_capabilities or */           \
+-   /* 1.1 (without KHR suffix) */                        \
++#define INSTANCE_ENTRYPOINTS_LIST(REQUIRED, OPTIONAL)   \
++   /* Vulkan 1.0 */                                     \
++   REQUIRED(GetInstanceProcAddr)                        \
++   REQUIRED(DestroyInstance)                            \
++   REQUIRED(GetPhysicalDeviceProperties)                \
++   REQUIRED(GetPhysicalDeviceImageFormatProperties)     \
++   REQUIRED(EnumerateDeviceExtensionProperties)         \
++   /* VK_KHR_surface */                                 \
++   OPTIONAL(DestroySurfaceKHR)                          \
++   OPTIONAL(GetPhysicalDeviceSurfaceCapabilitiesKHR)    \
++   OPTIONAL(GetPhysicalDeviceSurfaceFormatsKHR)         \
++   OPTIONAL(GetPhysicalDeviceSurfacePresentModesKHR)    \
++   OPTIONAL(GetPhysicalDeviceSurfaceSupportKHR)         \
++   /* VK_EXT_headless_surface */                        \
++   OPTIONAL(CreateHeadlessSurfaceEXT)                   \
++   /* VK_KHR_wayland_surface */                         \
++   OPTIONAL(CreateWaylandSurfaceKHR)                    \
++   /* VK_KHR_xcb_surface */                             \
++   OPTIONAL(CreateXcbSurfaceKHR)                        \
++   /* VK_KHR_get_surface_capabilities2 */               \
++   OPTIONAL(GetPhysicalDeviceSurfaceCapabilities2KHR)   \
++   OPTIONAL(GetPhysicalDeviceSurfaceFormats2KHR)        \
++   /* VK_KHR_get_physical_device_properties2 or */      \
++   /* 1.1 (without KHR suffix) */                       \
++   OPTIONAL(GetPhysicalDeviceImageFormatProperties2KHR) \
++   OPTIONAL(GetPhysicalDeviceFormatProperties2KHR)      \
++   OPTIONAL(GetPhysicalDeviceFeatures2KHR)              \
++   /* VK_KHR_device_group + VK_KHR_surface or */        \
++   /* 1.1 with VK_KHR_swapchain */                      \
++   OPTIONAL(GetPhysicalDevicePresentRectanglesKHR)      \
++   /* VK_KHR_external_fence_capabilities or */          \
++   /* 1.1 (without KHR suffix) */                       \
+    OPTIONAL(GetPhysicalDeviceExternalFencePropertiesKHR)
+ 
+ struct instance_dispatch_table
+@@ -131,6 +135,7 @@ struct instance_dispatch_table
+    REQUIRED(CreateImage)                            \
+    REQUIRED(DestroyImage)                           \
+    REQUIRED(GetImageMemoryRequirements)             \
++   REQUIRED(GetImageSubresourceLayout)              \
+    REQUIRED(BindImageMemory)                        \
+    REQUIRED(AllocateMemory)                         \
+    REQUIRED(FreeMemory)                             \
+@@ -358,7 +363,7 @@ class instance_private_data
+     *
+     * @param instance_data A valid pointer to instance_private_data
+     */
+-   static void destroy(instance_private_data* instance_data);
++   static void destroy(instance_private_data *instance_data);
+ 
+    /**
+     * @brief Check whether the given surface is already supported for presentation without the layer.
+@@ -386,7 +391,6 @@ class instance_private_data
+     * @brief List with the names of the enabled instance extensions.
+     */
+    util::extension_list enabled_extensions;
+-
+ };
+ 
+ /**
+@@ -447,7 +451,8 @@ class device_private_data
+    /**
+     * @brief Check whether the given swapchain is owned by us (the WSI Layer).
+     */
+-   bool layer_owns_swapchain(VkSwapchainKHR swapchain) const {
++   bool layer_owns_swapchain(VkSwapchainKHR swapchain) const
++   {
+       return layer_owns_all_swapchains(&swapchain, 1);
+    }
+ 
+@@ -536,7 +541,7 @@ class device_private_data
+     *
+     * @param device_data A valid pointer to device_private_data
+     */
+-   static void destroy(device_private_data* device_data);
++   static void destroy(device_private_data *device_data);
+ 
+    const util::allocator allocator;
+    util::unordered_set<VkSwapchainKHR> swapchains;
+diff --git a/wsi/wsi_factory.cpp b/wsi/wsi_factory.cpp
+index bd86f66..8344d50 100644
+--- a/wsi/wsi_factory.cpp
++++ b/wsi/wsi_factory.cpp
+@@ -46,6 +46,11 @@
+ #include "wayland/surface_properties.hpp"
+ #endif
+ 
++#if BUILD_WSI_X11
++#include <vulkan/vulkan_xcb.h>
++#include "x11/surface_properties.hpp"
++#endif
++
+ namespace wsi
+ {
+ 
+@@ -60,6 +65,9 @@ static struct wsi_extension
+ #if BUILD_WSI_WAYLAND
+    { { VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME, VK_KHR_WAYLAND_SURFACE_SPEC_VERSION }, VK_ICD_WSI_PLATFORM_WAYLAND },
+ #endif
++#if BUILD_WSI_X11
++   { { VK_KHR_XCB_SURFACE_EXTENSION_NAME, VK_KHR_XCB_SURFACE_SPEC_VERSION }, VK_ICD_WSI_PLATFORM_XCB },
++#endif
+ };
+ 
+ static surface_properties *get_surface_properties(VkIcdWsiPlatform platform)
+@@ -73,6 +81,10 @@ static surface_properties *get_surface_properties(VkIcdWsiPlatform platform)
+ #if BUILD_WSI_WAYLAND
+    case VK_ICD_WSI_PLATFORM_WAYLAND:
+       return &wayland::surface_properties::get_instance();
++#endif
++#if BUILD_WSI_X11
++   case VK_ICD_WSI_PLATFORM_XCB:
++      return &x11::surface_properties::get_instance();
+ #endif
+    default:
+       return nullptr;
+diff --git a/wsi/x11/surface.cpp b/wsi/x11/surface.cpp
+new file mode 100644
+index 0000000..5d546cf
+--- /dev/null
++++ b/wsi/x11/surface.cpp
+@@ -0,0 +1,103 @@
++/*
++ * Copyright (c) 2021 Arm Limited.
++ *
++ * SPDX-License-Identifier: MIT
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to
++ * deal in the Software without restriction, including without limitation the
++ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
++ * sell copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++/** @file
++ * @brief Implementation of a x11 WSI Surface
++ */
++
++#include "surface.hpp"
++#include "swapchain.hpp"
++#include "surface_properties.hpp"
++#include <iostream>
++#include <xcb/shm.h>
++#include <xcb/xcb.h>
++#include <xcb/xproto.h>
++#include <xcb/present.h>
++
++namespace wsi
++{
++namespace x11
++{
++
++struct surface::init_parameters
++{
++   const util::allocator &allocator;
++   xcb_connection_t *connection;
++   xcb_window_t window;
++};
++
++surface::surface(const init_parameters &params)
++   : wsi::surface()
++   , connection(params.connection)
++   , window(params.window)
++   , properties(*this, params.allocator)
++{
++}
++
++surface::~surface()
++{
++}
++
++bool surface::getWindowSizeAndDepth(VkExtent2D *windowExtent, int *depth)
++{
++   auto cookie = xcb_get_geometry(connection, window);
++   if (auto *geom = xcb_get_geometry_reply(connection, cookie, nullptr))
++   {
++      windowExtent->width = static_cast<uint32_t>(geom->width);
++      windowExtent->height = static_cast<uint32_t>(geom->height);
++      *depth = static_cast<int>(geom->depth);
++      free(geom);
++      return true;
++   }
++   return false;
++}
++
++wsi::surface_properties &surface::get_properties()
++{
++   return properties;
++}
++
++util::unique_ptr<swapchain_base> surface::allocate_swapchain(layer::device_private_data &dev_data,
++                                                             const VkAllocationCallbacks *allocator)
++{
++   util::allocator alloc{ dev_data.get_allocator(), VK_SYSTEM_ALLOCATION_SCOPE_OBJECT, allocator };
++   auto chain = util::unique_ptr<swapchain_base>(alloc.make_unique<swapchain>(dev_data, allocator, this));
++
++   return chain;
++}
++
++util::unique_ptr<surface> surface::make_surface(const util::allocator &allocator, xcb_connection_t *conn,
++                                                xcb_window_t window)
++{
++   init_parameters params{ allocator, conn, window };
++   auto wsi_surface = allocator.make_unique<surface>(params);
++   if (wsi_surface != nullptr)
++   {
++      return wsi_surface;
++   }
++   return nullptr;
++}
++
++} /* namespace x11 */
++} /* namespace wsi */
+diff --git a/wsi/x11/surface.hpp b/wsi/x11/surface.hpp
+new file mode 100644
+index 0000000..ad3e9aa
+--- /dev/null
++++ b/wsi/x11/surface.hpp
+@@ -0,0 +1,66 @@
++/*
++ * Copyright (c) 2021 Arm Limited.
++ *
++ * SPDX-License-Identifier: MIT
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to
++ * deal in the Software without restriction, including without limitation the
++ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
++ * sell copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++/** @file
++ * @brief Definitions for a x11 WSI Surface
++ */
++
++#pragma once
++#include <vulkan/vk_icd.h>
++#include <xcb/xcb.h>
++#include <xcb/xproto.h>
++#include "wsi/surface.hpp"
++#include "surface_properties.hpp"
++
++namespace wsi
++{
++namespace x11
++{
++
++class surface : public wsi::surface
++{
++public:
++   surface() = delete;
++   struct init_parameters;
++
++   surface(const init_parameters &);
++   ~surface();
++
++   wsi::surface_properties &get_properties() override;
++   util::unique_ptr<swapchain_base> allocate_swapchain(layer::device_private_data &dev_data,
++                                                       const VkAllocationCallbacks *allocator) override;
++   static util::unique_ptr<surface> make_surface(const util::allocator &allocator, xcb_connection_t *conn,
++                                                 xcb_window_t window);
++
++   bool getWindowSizeAndDepth(VkExtent2D *windowExtent, int *depth);
++
++   xcb_connection_t *connection;
++   xcb_window_t window;
++
++private:
++   surface_properties properties;
++};
++
++} /* namespace x11 */
++} /* namespace wsi */
+diff --git a/wsi/x11/surface_properties.cpp b/wsi/x11/surface_properties.cpp
+new file mode 100644
+index 0000000..f896da9
+--- /dev/null
++++ b/wsi/x11/surface_properties.cpp
+@@ -0,0 +1,264 @@
++/*
++ * Copyright (c) 2017-2019, 2021-2022 Arm Limited.
++ *
++ * SPDX-License-Identifier: MIT
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to
++ * deal in the Software without restriction, including without limitation the
++ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
++ * sell copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++#define VK_USE_PLATFORM_ANDROID_KHR 1
++
++#include <algorithm>
++#include <array>
++#include <cassert>
++#include <cstdlib>
++#include <cstring>
++#include <iostream>
++#include <map>
++#include <mutex>
++
++#include <ostream>
++#include <vector>
++#include <xcb/xcb.h>
++#include <vulkan/vk_icd.h>
++#include <vulkan/vulkan.h>
++#include <vulkan/vulkan_xcb.h>
++#include <vulkan/vulkan_core.h>
++
++#include <layer/private_data.hpp>
++
++#include "surface_properties.hpp"
++#include "surface.hpp"
++#include "util/macros.hpp"
++#include "wsi/headless/surface.hpp"
++#include "wsi/surface_properties.hpp"
++
++#define UNUSED(x) ((void)(x))
++
++namespace wsi
++{
++namespace x11
++{
++
++surface_properties &surface_properties::get_instance()
++{
++   static surface_properties _instance;
++   return _instance;
++}
++
++surface_properties::surface_properties(surface &wsi_surface, const util::allocator &allocator)
++   : specific_surface(&wsi_surface)
++{
++}
++
++surface_properties::surface_properties()
++   : specific_surface(nullptr)
++{
++}
++
++VkResult surface_properties::get_surface_capabilities(VkPhysicalDevice physical_device,
++                                                      VkSurfaceCapabilitiesKHR *surface_capabilities)
++{
++   get_surface_capabilities_common(physical_device, surface_capabilities);
++   VkExtent2D extent;
++   int depth;
++   specific_surface->getWindowSizeAndDepth(&extent, &depth);
++   surface_capabilities->currentExtent = extent;
++   surface_capabilities->minImageExtent = extent;
++   surface_capabilities->maxImageExtent = extent;
++
++   surface_capabilities->minImageCount = 2;
++   surface_capabilities->maxImageCount = 0;
++
++   surface_capabilities->supportedTransforms = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
++   surface_capabilities->currentTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
++   surface_capabilities->maxImageArrayLayers = 1;
++   surface_capabilities->supportedUsageFlags =
++      VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
++      VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
++
++   return VK_SUCCESS;
++}
++
++std::vector<VkFormat> support_formats{
++   VK_FORMAT_R8G8B8A8_UNORM,    VK_FORMAT_R8G8B8_UNORM, VK_FORMAT_R5G6B5_UNORM_PACK16,
++   VK_FORMAT_B8G8R8A8_UNORM,    VK_FORMAT_D16_UNORM,    VK_FORMAT_X8_D24_UNORM_PACK32,
++   VK_FORMAT_D24_UNORM_S8_UINT, VK_FORMAT_D32_SFLOAT,   VK_FORMAT_D32_SFLOAT_S8_UINT,
++   VK_FORMAT_S8_UINT,           VK_FORMAT_R8_UNORM
++};
++
++VkResult surface_properties::get_surface_formats(VkPhysicalDevice physical_device, uint32_t *surface_format_count,
++                                                 VkSurfaceFormatKHR *surface_formats,
++                                                 VkSurfaceFormat2KHR *extended_surface_formats)
++{
++   std::vector<surface_format_properties> formats;
++   for (auto &format : support_formats)
++   {
++      if (format != VK_FORMAT_UNDEFINED)
++      {
++         formats.insert(formats.begin(), (surface_format_properties){ format });
++      }
++   }
++   return surface_properties_formats_helper(formats.begin(), formats.end(), surface_format_count, surface_formats,
++                                            extended_surface_formats);
++}
++
++VkResult surface_properties::get_surface_present_modes(VkPhysicalDevice physical_device, VkSurfaceKHR surface,
++                                                       uint32_t *present_mode_count, VkPresentModeKHR *present_modes)
++{
++   UNUSED(physical_device);
++   UNUSED(surface);
++
++   static const std::array<VkPresentModeKHR, 4> modes = { VK_PRESENT_MODE_IMMEDIATE_KHR, VK_PRESENT_MODE_FIFO_KHR,
++                                                          VK_PRESENT_MODE_FIFO_RELAXED_KHR,
++                                                          VK_PRESENT_MODE_MAILBOX_KHR };
++
++   return get_surface_present_modes_common(present_mode_count, present_modes, modes);
++}
++
++static const char *required_device_extensions[] = { VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME };
++
++VkResult surface_properties::get_required_device_extensions(util::extension_list &extension_list)
++{
++   return extension_list.add(required_device_extensions,
++                             sizeof(required_device_extensions) / sizeof(required_device_extensions[0]));
++}
++
++VWL_VKAPI_CALL(VkResult)
++CreateXcbSurfaceKHR(VkInstance instance, const VkXcbSurfaceCreateInfoKHR *pCreateInfo,
++                    const VkAllocationCallbacks *pAllocator, VkSurfaceKHR *pSurface) VWL_API_POST
++{
++
++   auto &instance_data = layer::instance_private_data::get(instance);
++   util::allocator allocator{ instance_data.get_allocator(), VK_SYSTEM_ALLOCATION_SCOPE_OBJECT, pAllocator };
++
++   auto wsi_surface = surface::make_surface(allocator, pCreateInfo->connection, pCreateInfo->window);
++   if (wsi_surface == nullptr)
++   {
++      return VK_ERROR_OUT_OF_HOST_MEMORY;
++   }
++   auto surface_base = util::unique_ptr<wsi::surface>(std::move(wsi_surface));
++   VkResult res = instance_data.disp.CreateXcbSurfaceKHR(instance, pCreateInfo, pAllocator, pSurface);
++   if (res == VK_SUCCESS)
++   {
++      res = instance_data.add_surface(*pSurface, surface_base);
++      if (res != VK_SUCCESS)
++      {
++         instance_data.disp.DestroySurfaceKHR(instance, *pSurface, pAllocator);
++      }
++   }
++   return res;
++}
++
++static bool visual_supported(xcb_visualtype_t *visual)
++{
++   if (!visual)
++      return false;
++
++   return visual->_class == XCB_VISUAL_CLASS_TRUE_COLOR || visual->_class == XCB_VISUAL_CLASS_DIRECT_COLOR;
++}
++
++static xcb_visualtype_t *screen_get_visualtype(xcb_screen_t *screen, xcb_visualid_t visual_id, unsigned *depth)
++{
++   xcb_depth_iterator_t depth_iter = xcb_screen_allowed_depths_iterator(screen);
++
++   for (; depth_iter.rem; xcb_depth_next(&depth_iter))
++   {
++      xcb_visualtype_iterator_t visual_iter = xcb_depth_visuals_iterator(depth_iter.data);
++
++      for (; visual_iter.rem; xcb_visualtype_next(&visual_iter))
++      {
++         if (visual_iter.data->visual_id == visual_id)
++         {
++            if (depth)
++               *depth = depth_iter.data->depth;
++            return visual_iter.data;
++         }
++      }
++   }
++
++   return NULL;
++}
++
++static xcb_visualtype_t *connection_get_visualtype(xcb_connection_t *conn, xcb_visualid_t visual_id)
++{
++   xcb_screen_iterator_t screen_iter = xcb_setup_roots_iterator(xcb_get_setup(conn));
++
++   /* For this we have to iterate over all of the screens which is rather
++    * annoying.  Fortunately, there is probably only 1.
++    */
++   for (; screen_iter.rem; xcb_screen_next(&screen_iter))
++   {
++      xcb_visualtype_t *visual = screen_get_visualtype(screen_iter.data, visual_id, NULL);
++      if (visual)
++         return visual;
++   }
++
++   return NULL;
++}
++
++VWL_VKAPI_CALL(VkResult)
++GetPhysicalDeviceSurfaceSupportKHR(VkPhysicalDevice physicalDevice, uint32_t queueFamilyIndex, VkSurfaceKHR surface,
++                                   VkBool32 *pSupported)
++{
++   *pSupported = VK_TRUE;
++   return VK_SUCCESS;
++}
++
++VWL_VKAPI_CALL(VkBool32)
++GetPhysicalDeviceXcbPresentationSupportKHR(VkPhysicalDevice physicalDevice, uint32_t queueFamilyIndex,
++                                           xcb_connection_t *connection, xcb_visualid_t visual_id)
++{
++   bool dev_supports_sync =
++      sync_fd_fence_sync::is_supported(layer::instance_private_data::get(physicalDevice), physicalDevice);
++   if (!dev_supports_sync)
++   {
++      return VK_FALSE;
++   }
++
++   if (!visual_supported(connection_get_visualtype(connection, visual_id)))
++      return false;
++
++   return VK_TRUE;
++}
++
++PFN_vkVoidFunction surface_properties::get_proc_addr(const char *name)
++{
++   if (strcmp(name, "vkCreateXcbSurfaceKHR") == 0)
++   {
++      return reinterpret_cast<PFN_vkVoidFunction>(CreateXcbSurfaceKHR);
++   }
++   if (strcmp(name, "vkGetPhysicalDeviceSurfaceSupportKHR") == 0)
++   {
++      return reinterpret_cast<PFN_vkVoidFunction>(GetPhysicalDeviceSurfaceSupportKHR);
++   }
++   if (strcmp(name, "vkGetPhysicalDeviceXcbPresentationSupportKHR") == 0)
++   {
++      return reinterpret_cast<PFN_vkVoidFunction>(GetPhysicalDeviceXcbPresentationSupportKHR);
++   }
++   return nullptr;
++}
++
++bool surface_properties::is_surface_extension_enabled(const layer::instance_private_data &instance_data)
++{
++   return instance_data.is_instance_extension_enabled(VK_KHR_XCB_SURFACE_EXTENSION_NAME);
++}
++
++} /* namespace x11 */
++} /* namespace wsi */
+diff --git a/wsi/x11/surface_properties.hpp b/wsi/x11/surface_properties.hpp
+new file mode 100644
+index 0000000..85160ad
+--- /dev/null
++++ b/wsi/x11/surface_properties.hpp
+@@ -0,0 +1,68 @@
++/*
++ * Copyright (c) 2017-2019, 2021-2022 Arm Limited.
++ *
++ * SPDX-License-Identifier: MIT
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to
++ * deal in the Software without restriction, including without limitation the
++ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
++ * sell copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++#pragma once
++
++#include "wsi/surface_properties.hpp"
++#include "util/unordered_set.hpp"
++
++namespace wsi
++{
++namespace x11
++{
++
++class surface;
++
++class surface_properties : public wsi::surface_properties
++{
++public:
++   surface_properties(surface &wsi_surface, const util::allocator &alloc);
++
++   static surface_properties &get_instance();
++
++   VkResult get_surface_capabilities(VkPhysicalDevice physical_device,
++                                     VkSurfaceCapabilitiesKHR *pSurfaceCapabilities) override;
++   VkResult get_surface_formats(VkPhysicalDevice physical_device, uint32_t *surfaceFormatCount,
++                                VkSurfaceFormatKHR *surfaceFormats,
++                                VkSurfaceFormat2KHR *extended_surface_formats) override;
++   VkResult get_surface_present_modes(VkPhysicalDevice physical_device, VkSurfaceKHR surface,
++                                      uint32_t *pPresentModeCount, VkPresentModeKHR *pPresentModes) override;
++
++   PFN_vkVoidFunction get_proc_addr(const char *name) override;
++
++   bool is_surface_extension_enabled(const layer::instance_private_data &instance_data) override;
++
++   VkResult get_required_device_extensions(util::extension_list &extension_list) override;
++
++private:
++   surface_properties();
++
++   /** If the properties are specific to a @ref wsi::wayland::surface this is a pointer to it. Can be nullptr for
++    * generic Wayland surface properties.
++    */
++   surface *specific_surface;
++};
++
++} // namespace x11
++} // namespace wsi
+diff --git a/wsi/x11/swapchain.cpp b/wsi/x11/swapchain.cpp
+new file mode 100644
+index 0000000..acf19ec
+--- /dev/null
++++ b/wsi/x11/swapchain.cpp
+@@ -0,0 +1,549 @@
++/*
++ * Copyright (c) 2017-2022 Arm Limited.
++ *
++ * SPDX-License-Identifier: MIT
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to
++ * deal in the Software without restriction, including without limitation the
++ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
++ * sell copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++/**
++ * @file swapchain.cpp
++ *
++ * @brief Contains the implementation for a x11 swapchain.
++ */
++
++#include <cassert>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++
++#include <iostream>
++#include <ostream>
++#include <util/timed_semaphore.hpp>
++#include <vulkan/vulkan_core.h>
++#include <vulkan/vulkan_android.h>
++#include <android/hardware_buffer.h>
++
++#include <sys/socket.h>
++#include <sys/mman.h>
++#include <poll.h>
++#include <xcb/present.h>
++#include <xcb/shm.h>
++#include <xcb/xcb.h>
++#include <xcb/xproto.h>
++
++#include "swapchain.hpp"
++#include "wsi/surface.hpp"
++
++namespace wsi
++{
++namespace x11
++{
++
++struct image_data
++{
++   /* Device memory backing the image. */
++   VkDeviceMemory memory{};
++   VkSubresourceLayout layout;
++   void *map;
++
++   AHardwareBuffer *ahb = nullptr;
++   xcb_shm_seg_t shmseg;
++   xcb_pixmap_t pixmap;
++   int dma_buf_fd = -1;
++   fence_sync present_fence;
++};
++
++int HB_TO_DMABUF_FD(AHardwareBuffer *hb)
++{
++   int socks[2];
++   if (socketpair(AF_UNIX, SOCK_STREAM, 0, socks) == 0)
++   {
++      try
++      {
++         std::thread sender{ [&]
++                             {
++                                AHardwareBuffer_sendHandleToUnixSocket(hb, socks[1]);
++                                close(socks[1]);
++                             } };
++         struct msghdr msg
++         {
++         };
++         msg.msg_name = nullptr;
++         msg.msg_namelen = 0;
++         struct iovec iov
++         {
++         };
++         char iobuf[100];
++         iov.iov_base = iobuf;
++         iov.iov_len = sizeof(iobuf);
++         msg.msg_iov = &iov;
++         msg.msg_iovlen = 1;
++         constexpr int CONTROLLEN = CMSG_SPACE(sizeof(int) * 50);
++         union
++         {
++            cmsghdr _; // for alignment
++            char controlBuffer[CONTROLLEN];
++         } controlBufferUnion;
++         memset(&controlBufferUnion, 0, CONTROLLEN);
++         msg.msg_control = &controlBufferUnion;
++         msg.msg_controllen = sizeof(controlBufferUnion);
++         const int fdindex = 0;
++         int recfd = -1;
++         errno = 0;
++         while (recvmsg(socks[0], &msg, 0) > 0)
++         {
++            for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg); cmsg != nullptr; cmsg = CMSG_NXTHDR(&msg, cmsg))
++            {
++               if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS && recfd == -1)
++               {
++                  memcpy(&recfd, CMSG_DATA(cmsg) + sizeof(int) * fdindex, sizeof(recfd));
++               }
++            }
++         }
++         close(socks[0]);
++         sender.join();
++         return recfd;
++      }
++      catch (...)
++      {
++         close(socks[0]);
++      }
++   }
++   return -1;
++}
++
++swapchain::swapchain(layer::device_private_data &dev_data, const VkAllocationCallbacks *pAllocator, surface *surface)
++   : wsi::swapchain_base(dev_data, pAllocator)
++   , m_surface(surface)
++   , m_send_sbc(0)
++#if WSI_IMAGE_COMPRESSION_CONTROL_SWAPCHAIN
++   , m_image_compression_control{}
++#endif
++{
++}
++
++swapchain::~swapchain()
++{
++   /* Call the base's teardown */
++   auto cookie = xcb_free_gc(connection, gc);
++   xcb_discard_reply(connection, cookie.sequence);
++   teardown();
++}
++
++VkResult swapchain::create_and_bind_swapchain_image(VkImageCreateInfo image_create, wsi::swapchain_image &image)
++{
++   VkResult res = VK_SUCCESS;
++   const std::lock_guard<std::recursive_mutex> lock(m_image_status_mutex);
++
++   m_image_create_info = image_create;
++   m_image_create_info.tiling = VK_IMAGE_TILING_LINEAR;
++
++#if WSI_IMAGE_COMPRESSION_CONTROL_SWAPCHAIN
++   if (m_device_data.is_swapchain_compression_control_enabled())
++   {
++      /* Initialize compression control */
++      m_image_compression_control.sType = VK_STRUCTURE_TYPE_IMAGE_COMPRESSION_CONTROL_EXT;
++      m_image_compression_control.compressionControlPlaneCount =
++         m_image_compression_control_params.compression_control_plane_count;
++      m_image_compression_control.flags = m_image_compression_control_params.flags;
++      m_image_compression_control.pFixedRateFlags = m_image_compression_control_params.fixed_rate_flags.data();
++      m_image_compression_control.pNext = m_image_create_info.pNext;
++
++      m_image_create_info.pNext = &m_image_compression_control;
++   }
++#endif
++   res = m_device_data.disp.CreateImage(m_device, &m_image_create_info, get_allocation_callbacks(), &image.image);
++   if (res != VK_SUCCESS)
++   {
++      return res;
++   }
++
++   VkMemoryRequirements memory_requirements = {};
++   m_device_data.disp.GetImageMemoryRequirements(m_device, image.image, &memory_requirements);
++
++   /* Find a memory type */
++   size_t mem_type_idx = 0;
++   for (; mem_type_idx < 8 * sizeof(memory_requirements.memoryTypeBits); ++mem_type_idx)
++   {
++      if (memory_requirements.memoryTypeBits & (1u << mem_type_idx))
++      {
++         break;
++      }
++   }
++
++   assert(mem_type_idx <= 8 * sizeof(memory_requirements.memoryTypeBits) - 1);
++
++   VkMemoryAllocateInfo gmem_info = {};
++   gmem_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
++   gmem_info.allocationSize = memory_requirements.size;
++   gmem_info.memoryTypeIndex = mem_type_idx;
++
++   /* Create image_data */
++   image_data *data = nullptr;
++   data = m_allocator.create<image_data>(1);
++   if (data == nullptr)
++   {
++      m_device_data.disp.DestroyImage(m_device, image.image, get_allocation_callbacks());
++      return VK_ERROR_OUT_OF_HOST_MEMORY;
++   }
++   image.data = reinterpret_cast<void *>(data);
++   image.status = wsi::swapchain_image::FREE;
++
++   /* Alloc HardwareBuffer */
++   uint32_t native_format;
++   switch (m_image_create_info.format)
++   {
++   case VK_FORMAT_B8G8R8A8_UNORM:
++   case VK_FORMAT_R8G8B8A8_UNORM:
++      native_format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
++      break;
++   case VK_FORMAT_R8G8B8_UNORM:
++      native_format = AHARDWAREBUFFER_FORMAT_R8G8B8_UNORM;
++      break;
++   case VK_FORMAT_R5G6B5_UNORM_PACK16:
++      native_format = AHARDWAREBUFFER_FORMAT_R5G6B5_UNORM;
++      break;
++   case VK_FORMAT_R16G16B16A16_SFLOAT:
++      native_format = AHARDWAREBUFFER_FORMAT_R16G16B16A16_FLOAT;
++      break;
++   case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
++      native_format = AHARDWAREBUFFER_FORMAT_R10G10B10A2_UNORM;
++      break;
++   case VK_FORMAT_D16_UNORM:
++      native_format = AHARDWAREBUFFER_FORMAT_D16_UNORM;
++      break;
++   case VK_FORMAT_X8_D24_UNORM_PACK32:
++      native_format = AHARDWAREBUFFER_FORMAT_D24_UNORM;
++      break;
++   case VK_FORMAT_D24_UNORM_S8_UINT:
++      native_format = AHARDWAREBUFFER_FORMAT_D24_UNORM_S8_UINT;
++      break;
++   case VK_FORMAT_D32_SFLOAT:
++      native_format = AHARDWAREBUFFER_FORMAT_D32_FLOAT;
++      break;
++   case VK_FORMAT_D32_SFLOAT_S8_UINT:
++      native_format = AHARDWAREBUFFER_FORMAT_D32_FLOAT_S8_UINT;
++      break;
++   case VK_FORMAT_S8_UINT:
++      native_format = AHARDWAREBUFFER_FORMAT_S8_UINT;
++      break;
++   case VK_FORMAT_R8_UNORM:
++      native_format = AHARDWAREBUFFER_FORMAT_R8_UNORM;
++      break;
++   default:
++      native_format = 0;
++      break;
++   }
++   if (!native_format)
++   {
++      std::cout << "unsupported swapchain format=" << m_image_create_info.format << std::endl;
++      m_device_data.disp.DestroyImage(m_device, image.image, get_allocation_callbacks());
++      return VK_ERROR_OUT_OF_HOST_MEMORY;
++   }
++   std::cout << "format: " << m_image_create_info.format << std::endl;
++   AHardwareBuffer_Desc desc = {};
++   desc.format = native_format;
++   desc.layers = 1;
++   desc.width = m_image_create_info.extent.width;
++   desc.height = m_image_create_info.extent.height;
++   desc.usage = AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN | AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN |
++                AHARDWAREBUFFER_USAGE_GPU_FRAMEBUFFER | AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE;
++   if (AHardwareBuffer_allocate(&desc, &data->ahb) == 0)
++   {
++      VkImportAndroidHardwareBufferInfoANDROID hb_info = {};
++      hb_info.sType = VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID;
++      hb_info.buffer = data->ahb;
++      hb_info.pNext = VK_NULL_HANDLE;
++      gmem_info.pNext = &hb_info;
++      dprintf(-1, ""); // fix fault
++      std::cout << "HardwareBuffer alloc success." << std::endl;
++   }
++   else
++   {
++      std::cout << "HardwareBuffer alloc failed." << std::endl;
++      destroy_image(image);
++      return VK_ERROR_OUT_OF_HOST_MEMORY;
++   }
++
++   res = m_device_data.disp.AllocateMemory(m_device, &gmem_info, get_allocation_callbacks(), &data->memory);
++   assert(VK_SUCCESS == res);
++   if (res != VK_SUCCESS)
++   {
++      destroy_image(image);
++      return res;
++   }
++
++   res = m_device_data.disp.BindImageMemory(m_device, image.image, data->memory, 0);
++   assert(VK_SUCCESS == res);
++   if (res != VK_SUCCESS)
++   {
++      destroy_image(image);
++      return res;
++   }
++
++   /* Initialize presentation fence. */
++   auto present_fence = fence_sync::create(m_device_data);
++   if (!present_fence.has_value())
++   {
++      destroy_image(image);
++      return VK_ERROR_OUT_OF_HOST_MEMORY;
++   }
++   data->present_fence = std::move(present_fence.value());
++
++   VkImageSubresource subres = {
++      .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
++      .mipLevel = 0,
++      .arrayLayer = 0,
++
++   };
++   m_device_data.disp.GetImageSubresourceLayout(m_device, image.image, &subres, &data->layout);
++
++   if (has_shm && has_present)
++   {
++      data->dma_buf_fd = HB_TO_DMABUF_FD(data->ahb);
++      if (data->dma_buf_fd != -1)
++      {
++         void *addr = mmap(nullptr, 4 * 4, PROT_READ | PROT_WRITE, MAP_SHARED, data->dma_buf_fd, 0);
++         if (addr != MAP_FAILED)
++         {
++            munmap(addr, 4 * 4);
++         }
++         else
++         {
++            has_shm = false;
++         }
++      }
++   }
++
++   if (has_shm)
++   {
++      auto conn = m_surface->connection;
++      auto window = m_surface->window;
++      data->shmseg = xcb_generate_id(conn);
++      data->pixmap = xcb_generate_id(conn);
++      auto cookie = xcb_shm_attach_fd_checked(conn, data->shmseg, data->dma_buf_fd, false);
++      auto err = xcb_request_check(conn, cookie);
++      if (err != nullptr)
++      {
++         std::cout << "attach shm fd failed." << std::endl;
++         free(err);
++      }
++      cookie = xcb_shm_create_pixmap_checked(conn, data->pixmap, window, data->layout.rowPitch / 4,
++                                             m_image_create_info.extent.height, 24, data->shmseg, 0);
++      err = xcb_request_check(conn, cookie);
++      if (err != nullptr)
++      {
++         free(err);
++         has_shm = false;
++         std::cout << "create shm pixmap failed." << std::endl;
++      }
++   }
++
++   std::cout << "create swapchain image success." << std::endl;
++   return res;
++}
++
++void swapchain::present_image(uint32_t pending_index)
++{
++   image_data *image = reinterpret_cast<image_data *>(m_swapchain_images[pending_index].data);
++
++   if (has_shm && has_present)
++   {
++      auto serial = ++m_send_sbc;
++      uint32_t options = XCB_PRESENT_OPTION_NONE;
++      if (m_present_mode == VK_PRESENT_MODE_IMMEDIATE_KHR || m_present_mode == VK_PRESENT_MODE_MAILBOX_KHR ||
++          m_present_mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR)
++         options |= XCB_PRESENT_OPTION_ASYNC;
++      auto cookie = xcb_present_pixmap_checked(connection, window, image->pixmap, serial, 0, 0, 0, 0, 0, 0, 0, options,
++                                               0, 0, 0, 0, nullptr);
++      auto err = xcb_request_check(connection, cookie);
++      if (err != nullptr)
++      {
++         free(err);
++         set_error_state(VK_ERROR_SURFACE_LOST_KHR);
++      }
++   }
++   else
++   {
++      AHardwareBuffer_lock(image->ahb, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN, -1, nullptr, (void **)&image->map);
++      int stride = image->layout.rowPitch;
++      int bytesPerPixel = 4;
++      int width = stride / bytesPerPixel;
++      auto buffer = reinterpret_cast<uint8_t *>(image->map);
++      size_t max_request_size = static_cast<size_t>(xcb_get_maximum_request_length(connection)) * 4;
++      size_t max_strides = (max_request_size - sizeof(xcb_put_image_request_t)) / stride;
++      for (size_t y = 0; y < windowExtent.height; y += max_strides)
++      {
++         size_t num_strides = std::min(max_strides, windowExtent.height - y);
++         xcb_put_image(connection, XCB_IMAGE_FORMAT_Z_PIXMAP, window, gc, width, num_strides, 0, y, // dst x, y
++                       0,                                                                           // left_pad
++                       depth,
++                       num_strides * stride, // data_len
++                       buffer + y * stride   // data
++         );
++      }
++      int32_t fence = -1;
++      AHardwareBuffer_unlock(image->ahb, &fence);
++   }
++   xcb_flush(connection);
++   unpresent_image(pending_index);
++}
++
++void swapchain::destroy_image(wsi::swapchain_image &image)
++{
++   std::unique_lock<std::recursive_mutex> image_status_lock(m_image_status_mutex);
++   if (image.status != wsi::swapchain_image::INVALID)
++   {
++      if (image.image != VK_NULL_HANDLE)
++      {
++         m_device_data.disp.DestroyImage(m_device, image.image, get_allocation_callbacks());
++         image.image = VK_NULL_HANDLE;
++      }
++
++      image.status = wsi::swapchain_image::INVALID;
++   }
++
++   image_status_lock.unlock();
++
++   if (image.data != nullptr)
++   {
++      auto *data = reinterpret_cast<image_data *>(image.data);
++      if (data->memory != VK_NULL_HANDLE)
++      {
++         m_device_data.disp.FreeMemory(m_device, data->memory, get_allocation_callbacks());
++         data->memory = VK_NULL_HANDLE;
++      }
++      if (data->ahb != nullptr)
++      {
++         AHardwareBuffer_release(data->ahb);
++      }
++      if (has_shm)
++      {
++         xcb_free_pixmap(m_surface->connection, data->pixmap);
++         xcb_shm_detach(m_surface->connection, data->shmseg);
++      }
++      m_allocator.destroy(1, data);
++      image.data = nullptr;
++   }
++}
++
++VkResult swapchain::image_set_present_payload(swapchain_image &image, VkQueue queue, const VkSemaphore *sem_payload,
++                                              uint32_t sem_count)
++{
++   auto data = reinterpret_cast<image_data *>(image.data);
++   return data->present_fence.set_payload(queue, sem_payload, sem_count);
++}
++
++VkResult swapchain::image_wait_present(swapchain_image &image, uint64_t timeout)
++{
++   auto data = reinterpret_cast<image_data *>(image.data);
++   return data->present_fence.wait_payload(timeout);
++}
++
++VkResult swapchain::bind_swapchain_image(VkDevice &device, const VkBindImageMemoryInfo *bind_image_mem_info,
++                                         const VkBindImageMemorySwapchainInfoKHR *bind_sc_info)
++{
++   auto &device_data = layer::device_private_data::get(device);
++
++   const wsi::swapchain_image &swapchain_image = m_swapchain_images[bind_sc_info->imageIndex];
++   VkDeviceMemory memory = reinterpret_cast<image_data *>(swapchain_image.data)->memory;
++
++   return device_data.disp.BindImageMemory(device, bind_image_mem_info->image, memory, 0);
++}
++
++VkResult swapchain::init_platform(VkDevice device, const VkSwapchainCreateInfoKHR *swapchain_create_info,
++                                  bool &use_presentation_thread)
++{
++   if (m_surface == nullptr)
++   {
++      return VK_ERROR_INITIALIZATION_FAILED;
++   }
++
++   connection = m_surface->connection;
++   window = m_surface->window;
++   m_surface->getWindowSizeAndDepth(&windowExtent, &depth);
++
++   gc = xcb_generate_id(connection);
++   auto gc_cookie = xcb_create_gc_checked(connection, gc, window, XCB_GC_GRAPHICS_EXPOSURES, (uint32_t[]){ 0 });
++   xcb_request_check(connection, gc_cookie);
++
++   auto shm_cookie = xcb_shm_query_version_unchecked(connection);
++   auto shm_reply = xcb_shm_query_version_reply(connection, shm_cookie, nullptr);
++   if (shm_reply == nullptr ||
++       (shm_reply->major_version != 1 || shm_reply->minor_version < 2 || shm_reply->shared_pixmaps == false))
++   {
++      free(shm_reply);
++      has_shm = false;
++      std::cout << "MIT-SHM disabled." << std::endl;
++   }
++   else
++   {
++      has_shm = true;
++      std::cout << "MIT-SHM enabled." << std::endl;
++   }
++   if (has_shm)
++   {
++      auto present_cookie = xcb_present_query_version_unchecked(connection, 1, 2);
++      auto present_reply = xcb_present_query_version_reply(connection, present_cookie, nullptr);
++      if (present_reply == nullptr || present_reply->major_version != 1 || present_reply->minor_version < 2)
++      {
++         std::cout << "Present disabled." << std::endl;
++      }
++      else
++      {
++         std::cout << "Present enabled." << std::endl;
++         has_present = true;
++      }
++   }
++
++   // if (has_present)
++   // {
++   //    auto eid = xcb_generate_id(connection);
++   //    special_event = xcb_register_for_special_xge(connection, &xcb_present_id, eid, nullptr);
++   //    xcb_present_select_input(connection, eid, window,
++   //                             XCB_PRESENT_EVENT_MASK_IDLE_NOTIFY | XCB_PRESENT_EVENT_MASK_COMPLETE_NOTIFY |
++   //                                XCB_PRESENT_EVENT_MASK_CONFIGURE_NOTIFY);
++   // }
++
++   // switch (m_present_mode)
++   // {
++   // case VK_PRESENT_MODE_IMMEDIATE_KHR:
++   //    std::cout << "present mode immediate." << std::endl;
++   //    use_presentation_thread = false;
++   //    break;
++   // case VK_PRESENT_MODE_MAILBOX_KHR:
++   //    std::cout << "present mode mailbox." << std::endl;
++   //    use_presentation_thread = false;
++   //    break;
++   // default:
++   //    std::cout << "present mode fifo." << std::endl;
++   //    use_presentation_thread = true;
++   //    break;
++   // }
++
++   use_presentation_thread = true;
++   m_present_mode = VK_PRESENT_MODE_MAILBOX_KHR;
++
++   std::cout << "create swapchain." << std::endl;
++   return VK_SUCCESS;
++}
++
++} /* namespace x11 */
++} /* namespace wsi */
+diff --git a/wsi/x11/swapchain.hpp b/wsi/x11/swapchain.hpp
+new file mode 100644
+index 0000000..f7ea936
+--- /dev/null
++++ b/wsi/x11/swapchain.hpp
+@@ -0,0 +1,143 @@
++/*
++ * Copyright (c) 2017-2019, 2021-2022 Arm Limited.
++ *
++ * SPDX-License-Identifier: MIT
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to
++ * deal in the Software without restriction, including without limitation the
++ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
++ * sell copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++/**
++ * @file swapchain.hpp
++ *
++ * @brief Contains the class definition for a x11 swapchain.
++ */
++
++#pragma once
++
++#include "surface.hpp"
++#include <cstdint>
++#include <vulkan/vk_icd.h>
++#include <vulkan/vulkan.h>
++#include <wsi/swapchain_base.hpp>
++#include <xcb/xcb.h>
++#include <xcb/shm.h>
++#include <xcb/present.h>
++#include <xcb/xproto.h>
++
++namespace wsi
++{
++namespace x11
++{
++
++/**
++ * @brief x11 swapchain class.
++ *
++ * This class is mostly empty, because all the swapchain stuff is handled by the swapchain class,
++ * which we inherit. This class only provides a way to create an image and page-flip ops.
++ */
++class swapchain : public wsi::swapchain_base
++{
++public:
++   explicit swapchain(layer::device_private_data &dev_data, const VkAllocationCallbacks *pAllocator,
++                      surface *wsi_surface);
++
++   ~swapchain();
++
++   surface *get_surface()
++   {
++      return m_surface;
++   }
++
++protected:
++   /**
++    * @brief Platform specific init
++    */
++   VkResult init_platform(VkDevice device, const VkSwapchainCreateInfoKHR *swapchain_create_info,
++                          bool &use_presentation_thread) override;
++   /**
++    * @brief Creates and binds a new swapchain image.
++    *
++    * @param image_create_info Data to be used to create the image.
++    * @param image             Handle to the image.
++    *
++    * @return If image creation is successful returns VK_SUCCESS, otherwise
++    * will return VK_ERROR_OUT_OF_DEVICE_MEMORY or VK_ERROR_INITIALIZATION_FAILED
++    * depending on the error that occured.
++    */
++   VkResult create_and_bind_swapchain_image(VkImageCreateInfo image_create_info, wsi::swapchain_image &image) override;
++
++   /**
++    * @brief Method to perform a present - just calls unpresent_image on x11
++    *
++    * @param pendingIndex Index of the pending image to be presented.
++    *
++    */
++   void present_image(uint32_t pendingIndex) override;
++
++   /**
++    * @brief Method to release a swapchain image
++    *
++    * @param image Handle to the image about to be released.
++    */
++   void destroy_image(wsi::swapchain_image &image) override;
++
++   VkResult image_set_present_payload(swapchain_image &image, VkQueue queue, const VkSemaphore *sem_payload,
++                                      uint32_t sem_count) override;
++
++   VkResult image_wait_present(swapchain_image &image, uint64_t timeout) override;
++
++   /**
++    * @brief Bind image to a swapchain
++    *
++    * @param device              is the logical device that owns the images and memory.
++    * @param bind_image_mem_info details the image we want to bind.
++    * @param bind_sc_info        describes the swapchain memory to bind to.
++    *
++    * @return VK_SUCCESS on success, otherwise on failure VK_ERROR_OUT_OF_HOST_MEMORY or VK_ERROR_OUT_OF_DEVICE_MEMORY
++    * can be returned.
++    */
++   VkResult bind_swapchain_image(VkDevice &device, const VkBindImageMemoryInfo *bind_image_mem_info,
++                                 const VkBindImageMemorySwapchainInfoKHR *bind_sc_info) override;
++   // bool free_image_found();
++   //
++   // VkResult get_free_buffer(uint64_t *timeout) override;
++   //
++   // VkResult poll_special_event(xcb_connection_t *c, xcb_special_event_t *se, uint64_t timeout);
++
++private:
++   surface *m_surface;
++   uint64_t m_send_sbc;
++   xcb_connection_t *connection;
++
++   xcb_window_t window;
++   xcb_gcontext_t gc;
++   VkExtent2D windowExtent;
++   int depth;
++
++   bool has_shm = false;
++   bool has_present = false;
++
++   // xcb_special_event_t *special_event;
++#if WSI_IMAGE_COMPRESSION_CONTROL_SWAPCHAIN
++   VkImageCompressionControlEXT m_image_compression_control;
++#endif
++};
++
++} /* namespace x11 */
++} /* namespace wsi */
